@@ -14,7 +14,6 @@ DB_PATH = "bot.db"
 INVITE_LINK = "https://discord.com/oauth2/authorize?client_id=1419230856626704437&permissions=1275259905&integration_type=0&scope=bot"
 
 # Single (default) removal list (case-insensitive containment)
-# = your original BAN_CONTAINS plus everything you had in "strict"
 BAN_CONTAINS = {
     "humanoid",
     "timestep",
@@ -74,14 +73,14 @@ def to_json(obj: dict) -> str:
         s = s[:MAX_DB_TEXT] + "\n…(truncated)"
     return s
 
-def parse_flags_from_message(text: str) -> dict:
+def parse_flags_from_text(text: str) -> dict:
     """
     Accepts either a raw JSON object or a loose key:value list.
     Tries JSON first; falls back to simple parser like:
       key: value
       "Key Name"="Value"
     """
-    text = text.strip()
+    text = (text or "").strip()
     # try JSON
     try:
         data = json.loads(text)
@@ -101,6 +100,30 @@ def parse_flags_from_message(text: str) -> dict:
             flags[k] = v
     return flags
 
+async def parse_flags_from_message(msg: discord.Message) -> dict:
+    """Try text, then attachments (.json/.txt)."""
+    # First try text content
+    flags = parse_flags_from_text(msg.content)
+    if flags:
+        return flags
+
+    # Then try attachments
+    for att in msg.attachments:
+        name = (att.filename or "").lower()
+        if not (name.endswith(".json") or name.endswith(".txt")):
+            continue
+        if att.size and att.size > MAX_READ_BYTES:
+            continue
+        try:
+            data = await att.read()
+            text = data.decode("utf-8", errors="ignore")
+            flags = parse_flags_from_text(text)
+            if flags:
+                return flags
+        except Exception:
+            continue
+    return {}
+
 def filter_flags(ff: dict):
     kept, removed = {}, {}
     for k, v in ff.items():
@@ -110,6 +133,12 @@ def filter_flags(ff: dict):
         else:
             kept[k] = v
     return kept, removed
+
+async def safe_reply(ctx, content=None, **kwargs):
+    try:
+        return await ctx.reply(content, mention_author=False, **kwargs)
+    except discord.Forbidden:
+        return await ctx.send(content, **kwargs)
 
 def is_owner_check():
     async def pred(ctx: commands.Context):
@@ -144,68 +173,86 @@ async def on_guild_join(guild: discord.Guild):
 @bot.command(name="link")
 async def link(ctx: commands.Context):
     """Show the bot's invite link."""
-    await ctx.reply(f"Invite me with: {INVITE_LINK}")
+    await safe_reply(ctx, f"Invite me with: {INVITE_LINK}")
 
 @bot.command(name="ping")
 async def ping(ctx: commands.Context):
-    await ctx.reply("pong")
+    await safe_reply(ctx, "pong")
 
 @bot.tree.command(name="ping", description="Slash ping")
 async def slash_ping(interaction: discord.Interaction):
     await interaction.response.send_message("pong (slash)")
 
+@bot.command(name="diag")
+async def diag(ctx: commands.Context):
+    """Show required perms in this channel."""
+    me = ctx.guild.me if ctx.guild else None
+    if not me:
+        return await safe_reply(ctx, "Not in a guild.")
+    p = ctx.channel.permissions_for(me)
+    needed = {
+        "view_channel": p.view_channel,
+        "send_messages": p.send_messages,
+        "read_message_history": p.read_message_history,
+        "embed_links": p.embed_links,
+        "attach_files": p.attach_files,
+        "mention_everyone": p.mention_everyone,
+    }
+    missing = [k for k, ok in needed.items() if not ok]
+    msg = "All good ✅" if not missing else "Missing ❌: " + ", ".join(missing)
+    await safe_reply(ctx, msg)
+
 @bot.command(name="scan")
 async def scan(ctx: commands.Context):
     """
-    Paste your flags JSON (or key:value lines) after the command:
-      !scan { ...json... }
-    or send the flags in the previous message and do: !scan
+    Ways to use:
+      1) !scan { ...json... }
+      2) Paste flags in a message, then reply to it with !scan
+      3) Attach a .json or .txt file with the flags and run !scan (in the same message or by replying to it)
     """
     if ctx.guild and await is_guild_banned(ctx.guild.id):
         raise commands.CheckFailure("This server is banned.")
 
-    # Grab text after command; if empty, try previous message content
+    # 1) try to grab inline tail after command
     content = ctx.message.content
     m = re.search(r"scan\s+(.*)$", content, re.DOTALL | re.IGNORECASE)
-    text = (m.group(1).strip() if m else "").strip()
+    inline_text = (m.group(1).strip() if m else "").strip()
 
-    if not text and ctx.message.reference:
+    # Try inline first
+    ff = parse_flags_from_text(inline_text) if inline_text else {}
+
+    # 2) then try attachments on the same message
+    if not ff:
+        ff = await parse_flags_from_message(ctx.message)
+
+    # 3) then try the referenced message (content or its attachments)
+    if not ff and ctx.message.reference:
         try:
             ref_msg = await ctx.channel.fetch_message(ctx.message.reference.message_id)
-            text = ref_msg.content
+            ff = await parse_flags_from_message(ref_msg)
         except Exception:
             pass
 
-    if not text:
-        return await ctx.reply("Send flags after the command or reply to a message that has them.")
-
-    ff = parse_flags_from_message(text)
     if not ff:
-        return await ctx.reply("I couldn't parse any flags. Make sure it's JSON or key:value pairs.")
+        return await safe_reply(ctx, "Send flags after the command, attach a .json/.txt, or reply to a message/file that has them.")
 
     kept, removed = filter_flags(ff)
-
     kept_json = to_json(kept)
     removed_json = to_json(removed)
 
-    files = [
-        discord.File(io.BytesIO(kept_json.encode("utf-8")), filename="cleared_list.json"),
-    ]
+    files = [discord.File(io.BytesIO(kept_json.encode("utf-8")), filename="cleared_list.json")]
 
     title = "Illegal Flags Found!" if removed else "No Illegal Flags Found"
-    desc = (
-        f"Removed **{len(removed)}** • "
-        f"Kept **{len(kept)}**."
-    )
+    desc = f"Removed **{len(removed)}** • Kept **{len(kept)}**."
 
-    # short preview of removed (main)
     if removed:
         preview = "\n".join([f'"{k}": "{v}"' for k, v in list(removed.items())[:25]])
         if len(preview) > 1500:
             preview = preview[:1500] + "\n… (truncated)"
         desc += "\n\n```json\n" + preview + "\n```"
 
-    await ctx.reply(
+    await safe_reply(
+        ctx,
         embed=discord.Embed(
             title=title,
             description=desc,
@@ -220,9 +267,9 @@ async def scan(ctx: commands.Context):
 async def announce_here(ctx: commands.Context, *, message: str):
     """Owner-only. Announces to @everyone in the CURRENT channel (requires Mention Everyone permission)."""
     if not ctx.guild:
-        return await ctx.reply("Use this in a server channel.")
+        return await safe_reply(ctx, "Use this in a server channel.")
     if not ctx.guild.me.guild_permissions.mention_everyone:
-        return await ctx.reply("I don't have **Mention Everyone** permission here.")
+        return await safe_reply(ctx, "I don't have **Mention Everyone** permission here.")
     await ctx.send(
         f"@everyone {message}",
         allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False),
@@ -234,14 +281,14 @@ async def announce_here(ctx: commands.Context, *, message: str):
 async def optin_broadcast(ctx: commands.Context, channel: discord.TextChannel):
     """Admins can opt in a channel to receive owner broadcasts."""
     await set_broadcast_channel(ctx.guild.id, channel.id)
-    await ctx.reply(f"Opted in for broadcasts → {channel.mention}")
+    await safe_reply(ctx, f"Opted in for broadcasts → {channel.mention}")
 
 @bot.command(name="optout_broadcast")
 @admin_only_check()
 async def optout_broadcast(ctx: commands.Context):
     """Admins can opt out from broadcasts."""
     await set_broadcast_channel(ctx.guild.id, None)
-    await ctx.reply("Opted out of broadcasts.")
+    await safe_reply(ctx, "Opted out of broadcasts.")
 
 @bot.command(name="broadcast")
 @is_owner_check()
@@ -249,7 +296,7 @@ async def broadcast(ctx: commands.Context, *, message: str):
     """Owner-only. Sends an @everyone message to all opted-in channels where the bot can mention everyone."""
     rows = await get_broadcast_channels()
     if not rows:
-        return await ctx.reply("No servers have opted in.")
+        return await safe_reply(ctx, "No servers have opted in.")
 
     ok, fail = 0, 0
     for guild_id, chan_id in rows:
@@ -271,7 +318,7 @@ async def broadcast(ctx: commands.Context, *, message: str):
         except Exception:
             fail += 1
 
-    await ctx.reply(f"Broadcast complete. Success: {ok}, Failed: {fail}.")
+    await safe_reply(ctx, f"Broadcast complete. Success: {ok}, Failed: {fail}.")
 
 # ------------------ Basic moderation: ban/unban servers ------------------
 @bot.command(name="serverban")
@@ -279,14 +326,14 @@ async def broadcast(ctx: commands.Context, *, message: str):
 async def server_ban(ctx: commands.Context, guild_id: int):
     await db.execute("UPDATE guilds SET banned=1 WHERE guild_id=?", (guild_id,))
     await db.commit()
-    await ctx.reply(f"Banned server `{guild_id}`.")
+    await safe_reply(ctx, f"Banned server `{guild_id}`.")
 
 @bot.command(name="serverunban")
 @is_owner_check()
 async def server_unban(ctx: commands.Context, guild_id: int):
     await db.execute("UPDATE guilds SET banned=0 WHERE guild_id=?", (guild_id,))
     await db.commit()
-    await ctx.reply(f"Unbanned server `{guild_id}`.")
+    await safe_reply(ctx, f"Unbanned server `{guild_id}`.")
 
 # ------------------ Global checks & error handler ------------------
 @bot.check
@@ -299,7 +346,7 @@ async def block_banned(ctx: commands.Context):
 async def on_command_error(ctx, error):
     traceback.print_exception(type(error), error, error.__traceback__)
     try:
-        await ctx.reply(f"Error: {error.__class__.__name__}: {error}", mention_author=False)
+        await safe_reply(ctx, f"Error: {error.__class__.__name__}: {error}")
     except Exception:
         pass
 
