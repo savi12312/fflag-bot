@@ -275,6 +275,58 @@ async def announce_here(ctx: commands.Context, *, message: str):
         allowed_mentions=discord.AllowedMentions(everyone=True, users=False, roles=False),
     )
 
+# ------- Announce to all servers (owner-only) -------
+@bot.command(name="announceall")
+@is_owner_check()
+async def announce_all(ctx: commands.Context, *, message: str):
+    """Owner-only. Announces to @everyone in all servers the bot is in."""
+    # Confirm the command is being executed
+    confirmation = await ctx.send("Starting to send announcements to all servers...")
+    
+    success_count = 0
+    fail_count = 0
+    
+    for guild in bot.guilds:
+        # Skip banned guilds
+        if await is_guild_banned(guild.id):
+            print(f"Skipping banned guild: {guild.name} ({guild.id})")
+            fail_count += 1
+            continue
+            
+        # Find a suitable channel to send the message in each guild
+        target_channel = None
+        
+        # Check system channel first (usually the default welcome channel)
+        if guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:
+            target_channel = guild.system_channel
+        else:
+            # If no system channel or no permissions, find the first text channel with permissions
+            for channel in guild.text_channels:
+                if (channel.permissions_for(guild.me).send_messages and 
+                    channel.permissions_for(guild.me).mention_everyone):
+                    target_channel = channel
+                    break
+        
+        if target_channel:
+            try:
+                allowed_mentions = discord.AllowedMentions(everyone=True)
+                await target_channel.send(f"@everyone {message}", allowed_mentions=allowed_mentions)
+                print(f"Announcement sent to {guild.name} in channel #{target_channel.name}")
+                success_count += 1
+                await asyncio.sleep(1)  # Rate limiting to avoid being flagged
+            except discord.Forbidden:
+                print(f"Missing permissions in {guild.name}")
+                fail_count += 1
+            except discord.HTTPException as e:
+                print(f"Failed to send message in {guild.name}: {e}")
+                fail_count += 1
+        else:
+            print(f"Could not find a suitable channel in {guild.name}")
+            fail_count += 1
+    
+    # Update the confirmation message with results
+    await confirmation.edit(content=f"✅ Announcements completed! Sent to {success_count} servers, failed in {fail_count} servers.")
+
 # ------- Opt-in broadcast system -------
 @bot.command(name="optin_broadcast")
 @admin_only_check()
