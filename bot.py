@@ -1,5 +1,11 @@
-import os, re, json, io, asyncio, datetime, aiosqlite, discord
+import os, re, json, io, asyncio, datetime, aiosqlite, discord, traceback, logging
 from discord.ext import commands
+
+logging.basicConfig(level=logging.INFO)
+
+
+logging.basicConfig(level=logging.INFO)
+
 
 print("BOOT: starting")
 
@@ -281,6 +287,21 @@ async def server_unban(ctx: commands.Context, guild_id: int):
     await db.commit()
     await ctx.reply(f"Unbanned server `{guild_id}`.")
 
+# Simple test command
+@bot.command(name="ping")
+async def ping(ctx):
+    await ctx.reply("pong")
+
+# Global error handler to see what’s breaking
+@bot.event
+async def on_command_error(ctx, error):
+    traceback.print_exception(type(error), error, error.__traceback__)
+    try:
+        await ctx.reply(f"Error: {error.__class__.__name__}: {error}", mention_author=False)
+    except Exception:
+        pass
+
+
 # ------------------ Global checks ------------------
 @bot.check
 async def block_banned(ctx: commands.Context):
@@ -297,3 +318,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
