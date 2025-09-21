@@ -1,11 +1,8 @@
 import os, re, json, io, asyncio, datetime, aiosqlite, discord, traceback, logging
 from discord.ext import commands
+from discord import app_commands
 
 logging.basicConfig(level=logging.INFO)
-
-
-logging.basicConfig(level=logging.INFO)
-
 
 print("BOOT: starting")
 
@@ -16,16 +13,21 @@ MAX_DB_TEXT = 500_000
 DB_PATH = "bot.db"
 INVITE_LINK = "https://discord.com/oauth2/authorize?client_id=1419230856626704437&permissions=1275259905&integration_type=0&scope=bot"
 
-# Keep your original main-removed list EXACTLY the same
-BAN_CONTAINS = {"debounce", "decomp", "humanoid"}  # case-insensitive containment
-
-# Second stricter list you requested
-STRICT_CONTAINS = {"humanoid", "timestep", "runningcontroller2", "debounce", "replicator", "decomp"}  # case-insensitive
+# Single (default) removal list (case-insensitive containment)
+# = your original BAN_CONTAINS plus everything you had in "strict"
+BAN_CONTAINS = {
+    "humanoid",
+    "timestep",
+    "runningcontroller2",
+    "debounce",
+    "replicator",
+    "decomp",
+}
 
 # ------------------ Bot Setup ------------------
 intents = discord.Intents.default()
 intents.guilds = True
-intents.message_content = True
+intents.message_content = True  # MUST be enabled in Dev Portal too
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 
 db: aiosqlite.Connection | None = None
@@ -67,7 +69,6 @@ async def get_broadcast_channels() -> list[tuple[int, int]]:
 
 # ------------------ Helpers ------------------
 def to_json(obj: dict) -> str:
-    # hard limit to avoid Discord payload explosions
     s = json.dumps(obj, ensure_ascii=False, indent=2)
     if len(s) > MAX_DB_TEXT:
         s = s[:MAX_DB_TEXT] + "\n…(truncated)"
@@ -110,16 +111,6 @@ def filter_flags(ff: dict):
             kept[k] = v
     return kept, removed
 
-def split_strict(kept: dict):
-    final_kept, strict_removed = {}, {}
-    for k, v in kept.items():
-        low = k.lower()
-        if any(s in low for s in STRICT_CONTAINS):
-            strict_removed[k] = v
-        else:
-            final_kept[k] = v
-    return final_kept, strict_removed
-
 def is_owner_check():
     async def pred(ctx: commands.Context):
         return await ctx.bot.is_owner(ctx.author)
@@ -138,6 +129,12 @@ async def on_ready():
     await init_db()
     for g in bot.guilds:
         await upsert_guild(g)
+    # Sync slash commands so /ping works even if prefix fails
+    try:
+        await bot.tree.sync()
+        print("App commands synced.")
+    except Exception as e:
+        print("App command sync failed:", e)
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -148,6 +145,14 @@ async def on_guild_join(guild: discord.Guild):
 async def link(ctx: commands.Context):
     """Show the bot's invite link."""
     await ctx.reply(f"Invite me with: {INVITE_LINK}")
+
+@bot.command(name="ping")
+async def ping(ctx: commands.Context):
+    await ctx.reply("pong")
+
+@bot.tree.command(name="ping", description="Slash ping")
+async def slash_ping(interaction: discord.Interaction):
+    await interaction.response.send_message("pong (slash)")
 
 @bot.command(name="scan")
 async def scan(ctx: commands.Context):
@@ -179,22 +184,18 @@ async def scan(ctx: commands.Context):
         return await ctx.reply("I couldn't parse any flags. Make sure it's JSON or key:value pairs.")
 
     kept, removed = filter_flags(ff)
-    final_kept, strict_removed = split_strict(kept)
 
-    kept_json = to_json(final_kept)
+    kept_json = to_json(kept)
     removed_json = to_json(removed)
-    strict_json = to_json(strict_removed)
 
     files = [
         discord.File(io.BytesIO(kept_json.encode("utf-8")), filename="cleared_list.json"),
-        discord.File(io.BytesIO(strict_json.encode("utf-8")), filename="strict_list.json"),
     ]
 
-    title = "Illegal Flags Found!" if (removed or strict_removed) else "No Illegal Flags Found"
+    title = "Illegal Flags Found!" if removed else "No Illegal Flags Found"
     desc = (
-        f"Removed (main) **{len(removed)}** • "
-        f"Removed (strict) **{len(strict_removed)}** • "
-        f"Kept **{len(final_kept)}**."
+        f"Removed **{len(removed)}** • "
+        f"Kept **{len(kept)}**."
     )
 
     # short preview of removed (main)
@@ -208,7 +209,7 @@ async def scan(ctx: commands.Context):
         embed=discord.Embed(
             title=title,
             description=desc,
-            color=discord.Color.red() if (removed or strict_removed) else discord.Color.green(),
+            color=discord.Color.red() if removed else discord.Color.green(),
         ),
         files=files,
     )
@@ -287,12 +288,13 @@ async def server_unban(ctx: commands.Context, guild_id: int):
     await db.commit()
     await ctx.reply(f"Unbanned server `{guild_id}`.")
 
-# Simple test command
-@bot.command(name="ping")
-async def ping(ctx):
-    await ctx.reply("pong")
+# ------------------ Global checks & error handler ------------------
+@bot.check
+async def block_banned(ctx: commands.Context):
+    if ctx.guild is None:
+        return True
+    return not await is_guild_banned(ctx.guild.id)
 
-# Global error handler to see what’s breaking
 @bot.event
 async def on_command_error(ctx, error):
     traceback.print_exception(type(error), error, error.__traceback__)
@@ -300,14 +302,6 @@ async def on_command_error(ctx, error):
         await ctx.reply(f"Error: {error.__class__.__name__}: {error}", mention_author=False)
     except Exception:
         pass
-
-
-# ------------------ Global checks ------------------
-@bot.check
-async def block_banned(ctx: commands.Context):
-    if ctx.guild is None:
-        return True
-    return not await is_guild_banned(ctx.guild.id)
 
 # ------------------ Startup ------------------
 def main():
@@ -318,4 +312,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
